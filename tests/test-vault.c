@@ -28,9 +28,9 @@ static const struct {
 	{ "23.cfg", "$VAULT1$=0123456789abc\n" },
 };
 
-static int tests, failures;
+static int tests, failures, partial_store;
 static char workdir[] = "/tmp/test-vault.XXXXXX";
-static char logpath[PATH_MAX];
+static char logpath[PATH_MAX], logged[8192];
 
 static int ok(int success, const char *name)
 {
@@ -97,14 +97,25 @@ static const char *load(const char *root, const char *options)
 	nebstruct_vault_macro_data data;
 	size_t len;
 	FILE *fp;
+	int loaded;
 
 	if(truncate(logpath, 0) != 0 && errno != ENOENT) {
 		printf("Bail out! cannot truncate %s\n", logpath);
 		exit(1);
 	}
 	snprintf(args, sizeof(args), "vault=%s/%s password=test %s", workdir, root, options);
+	max_files = 64;
+	warn_no_match = FALSE;
 
-	if(parse_args(args) == OK && parse_vault() == OK) {
+	loaded = parse_args(args) == OK && parse_vault() == OK;
+	len = 0;
+	if((fp = fopen(logpath, "r"))) {
+		len = fread(logged, 1, sizeof(logged) - 1, fp);
+		fclose(fp);
+	}
+	logged[len] = '\0';
+
+	if(loaded) {
 		/* look every macro up through the callback naemon uses */
 		len = snprintf(result, sizeof(result), "OK:");
 		for(int i = 0; i < macro_store->kv_pairs && len < sizeof(result); i++) {
@@ -115,12 +126,8 @@ static const char *load(const char *root, const char *options)
 			free(data.value);
 		}
 	} else {
-		len = snprintf(result, sizeof(result), "ERROR: ");
-		if((fp = fopen(logpath, "r"))) {
-			len += fread(result + len, 1, sizeof(result) - len - 1, fp);
-			fclose(fp);
-		}
-		result[len] = '\0';
+		snprintf(result, sizeof(result), "ERROR: %s", logged);
+		partial_store = macro_store != NULL;
 	}
 	kvvec_destroy(macro_store, KVVEC_FREE_ALL);
 	macro_store = NULL;
@@ -229,6 +236,171 @@ static void test_bounds(void)
 	check("vault with many blocks", "long.cfg", "", expected);
 }
 
+/* scenarios of the vault-includes spec, named after them */
+static void test_includes(void)
+{
+	char text[PATH_MAX + 64], from[PATH_MAX], to[PATH_MAX], expected[4096];
+	const char *bad[] = { "include =b.cfg", "include= b.cfg", "include = b.cfg", "include_dir =d", "include_dir=\td", "include= *.cfg" };
+	const char *bad_limits[] = { "0", "-1", "abc", "12x", "", "99999999999" };
+	const char *plain = "$VAULT:P$=this is a plaintext file and must not be accepted\n";
+
+	/* include directives */
+	write_vault("n/vault.cfg", "$VAULT:R$=r\ninclude=a.cfg\n");
+	write_vault("n/a.cfg", "include=b.cfg\n$VAULT:A$=a\n");
+	write_vault("n/b.cfg", "$VAULT:B$=b\n");
+	check("Nested includes", "n/vault.cfg", "", "OK: VAULT:R=r VAULT:B=b VAULT:A=a");
+	write_file("n/plain.cfg", plain, strlen(plain));
+	write_vault("n/p.cfg", "include=plain.cfg\n");
+	check("Plaintext include", "n/p.cfg", "", "ERROR: n/plain.cfg is not a vim crypted file");
+	for(size_t i = 0; i < ARRAY_SIZE(bad); i++) {
+		snprintf(text, sizeof(text), "%s\n", bad[i]);
+		write_vault("n/blank.cfg", text);
+		snprintf(expected, sizeof(expected), "Blank around the equals sign: %s", bad[i]);
+		check(expected, "n/blank.cfg", "", "ERROR: parse error in vault file");
+	}
+	write_vault("n/stripped.cfg", " \t include=b.cfg \t\n  # indented comment\n");
+	check("leading and trailing blanks of a line are ignored", "n/stripped.cfg", "", "OK: VAULT:B=b");
+
+	/* path resolution, the working directory is / */
+	write_vault("etc/vault.cfg", "include=vault.d/site.cfg\n");
+	write_vault("etc/vault.d/site.cfg", "$VAULT:S$=site\n");
+	check("Relative to the including file", "etc/vault.cfg", "", "OK: VAULT:S=site");
+	if(chdir(workdir) == 0) {
+		check("relative vault argument", "unused", "vault=etc/vault.cfg", "OK: VAULT:S=site");
+		if(chdir("/") != 0)
+			exit(1);
+	}
+	write_vault("d/vault.cfg", "include_dir=level1\n");
+	write_vault("d/level1/file1.cfg", "$VAULT:V$=before\ninclude_dir=level2\n$VAULT:L1$=after\n");
+	write_vault("d/level1/level2/file21.cfg", "$VAULT:V$=21\n");
+	write_vault("d/level1/level2/file22.cfg", "$VAULT:V$=22\n$VAULT:X$=x\n");
+	write_vault("d/level2/decoy.cfg", "$VAULT:DECOY$=wrong\n");
+	check("Nested directory directive", "d/vault.cfg", "", "OK: VAULT:V=22 VAULT:X=x VAULT:L1=after");
+	write_vault("shared/real.cfg", "include=local.cfg\n");
+	write_vault("shared/local.cfg", "$VAULT:L$=wrong\n");
+	write_vault("site/local.cfg", "$VAULT:L$=site\n");
+	snprintf(from, sizeof(from), "%s/shared/real.cfg", workdir);
+	snprintf(to, sizeof(to), "%s/site/vault.cfg", workdir);
+	ok(symlink(from, to) == 0, "create symlink site/vault.cfg");
+	check("symlinked vault resolves includes from the link location", "site/vault.cfg", "", "OK: VAULT:L=site");
+	snprintf(text, sizeof(text), "include=%s/n/b.cfg\n", workdir);
+	write_vault("abs.cfg", text);
+	check("absolute include path", "abs.cfg", "", "OK: VAULT:B=b");
+
+	/* selection and order */
+	write_vault("o/vault.cfg", "include=vault.d/db-*.cfg\n");
+	write_vault("o/vault.d/db-b.cfg", "$VAULT:DB$=b\n$VAULT:B$=1\n");
+	write_vault("o/vault.d/db-a.cfg", "$VAULT:DB$=a\n$VAULT:A$=1\n");
+	check("Sorted matches", "o/vault.cfg", "", "OK: VAULT:DB=b VAULT:A=1 VAULT:B=1");
+	write_vault("o/brace.cfg", "include=vault.d/db-{b,a}.cfg\n");
+	check("brace alternatives in written order", "o/brace.cfg", "", "OK: VAULT:DB=a VAULT:B=1 VAULT:A=1");
+	write_vault("s/vault.cfg", "include_dir=vault.d\n");
+	write_vault("s/vault.d/a.cfg", "$VAULT:A$=a\n");
+	write_vault("s/vault.d/sub/b.cfg", "$VAULT:B$=b\n");
+	write_vault("s/vault.d/.hidden.cfg", "$VAULT:H$=h\n");
+	write_file("s/vault.d/notes.txt", "junk\n", 5);
+	check("No automatic descent, hidden and other files ignored", "s/vault.cfg", "", "OK: VAULT:A=a");
+	write_vault("w/vault.cfg", "include_dir=*\n");
+	write_vault("w/a/one.cfg", "$VAULT:A$=one\n");
+	write_vault("w/b/two.cfg", "$VAULT:B$=two\n");
+	write_vault("w/b/deeper/three.cfg", "$VAULT:D$=x\n");
+	check("include_dir=* selects only immediate directories", "w/vault.cfg", "", "OK: VAULT:A=one VAULT:B=two");
+
+	/* optional and required selections */
+	write_vault("q/vault.cfg", "$VAULT:DEF$=default\ninclude=hosts/myhost-*.cfg\n");
+	write_vault("q/hosts/other.cfg", "$VAULT:O$=other\n");
+	check("Optional host file", "q/vault.cfg", "", "OK: VAULT:DEF=default");
+	ok(strstr(logged, "Warning") == NULL, "Optional host file: no warning by default");
+	check("Requested warning", "q/vault.cfg", "warn_no_match=yes", "OK: VAULT:DEF=default");
+	ok(strstr(logged, "matches no files") != NULL, "Requested warning: warning logged");
+	check("warn_no_match=no", "q/vault.cfg", "warn_no_match=no", "OK: VAULT:DEF=default");
+	write_vault("q/onlyinc.cfg", "include=hosts/myhost-*.cfg\n");
+	check("include-only vault, nothing matched", "q/onlyinc.cfg", "", "OK:");
+	write_vault("q/emptydir.cfg", "include_dir=empty\n");
+	nspath_mkdir_p(mkstr("%s/q/empty", workdir), 0700, 0);
+	check("include_dir of an empty directory", "q/emptydir.cfg", "", "OK:");
+	write_vault("q/req.cfg", "include=required.cfg\n");
+	check("Missing required file", "q/req.cfg", "", "ERROR: no such file");
+	write_vault("q/reqdir.cfg", "include_dir=missing\n");
+	check("missing include_dir", "q/reqdir.cfg", "", "ERROR: cannot include");
+	write_vault("q/wilddir.cfg", "include=missing/*.cfg\n");
+	check("wildcard in a missing directory", "q/wilddir.cfg", "", "ERROR: cannot include");
+	check("Invalid warn_no_match: 1", "q/vault.cfg", "warn_no_match=1", "ERROR: warn_no_match must be yes or no");
+	check("Invalid warn_no_match: no value", "q/vault.cfg", "warn_no_match", "ERROR: warn_no_match must be yes or no");
+	check("unknown module argument", "q/vault.cfg", "foo=bar", "ERROR: unknown module argument");
+
+	/* duplicates and file limit */
+	write_vault("c/vault.cfg", "include=a.cfg\n");
+	write_vault("c/a.cfg", "include=vault.cfg\n");
+	check("Cycle", "c/vault.cfg", "", "ERROR: c/vault.cfg is included more than once");
+	write_vault("c/b.cfg", "$VAULT:B$=b\n");
+	snprintf(from, sizeof(from), "%s/c/b.cfg", workdir);
+	snprintf(to, sizeof(to), "%s/c/alias.cfg", workdir);
+	ok(symlink(from, to) == 0, "create symlink c/alias.cfg");
+	write_vault("c/dup.cfg", "include=b.cfg\ninclude=b.cfg\n");
+	check("duplicate: repeated include", "c/dup.cfg", "", "ERROR: included more than once");
+	write_vault("c/dup.cfg", "include=b*.cfg\ninclude=?.cfg\n");
+	check("duplicate: overlapping patterns", "c/dup.cfg", "", "ERROR: included more than once");
+	write_vault("c/dup.cfg", "include=b.cfg\ninclude=alias.cfg\n");
+	check("duplicate: symlink alias", "c/dup.cfg", "", "ERROR: included more than once");
+	write_vault("c/dup.cfg", "include=b.cfg\ninclude=../c/b.cfg\n");
+	check("duplicate: path with ..", "c/dup.cfg", "", "ERROR: included more than once");
+
+	for(int i = 0; i < 64; i++) {
+		snprintf(text, sizeof(text), "$VAULT:%d$=%d\n", i, i);
+		snprintf(to, sizeof(to), "lim/f/%02d.cfg", i);
+		write_vault(to, text);
+	}
+	strcpy(expected, "OK:");
+	for(int i = 0; i < 63; i++)
+		snprintf(expected + strlen(expected), sizeof(expected) - strlen(expected), " VAULT:%d=%d", i, i);
+	write_vault("lim/63.cfg", "include=f/[0-5]?.cfg\ninclude=f/6[0-2].cfg\n");
+	check("Limit: 64 files including the vault", "lim/63.cfg", "", expected);
+	write_file("lim/f/63.cfg", plain, strlen(plain));
+	write_vault("lim/64.cfg", "include=f/[0-5]?.cfg\ninclude=f/6[0-3].cfg\n");
+	check("Limit: the 65th file is rejected before it is read", "lim/64.cfg", "", "ERROR: max_files=64 reached");
+	check("max_files=128", "lim/63.cfg", "max_files=128", expected);
+	check("max_files=1 allows the vault alone", "n/b.cfg", "max_files=1", "OK: VAULT:B=b");
+	check("max_files=1 rejects an include", "n/a.cfg", "max_files=1", "ERROR: max_files=1 reached");
+	for(size_t i = 0; i < ARRAY_SIZE(bad_limits); i++) {
+		snprintf(text, sizeof(text), "max_files=%s", bad_limits[i]);
+		snprintf(expected, sizeof(expected), "Invalid limit: %s", text);
+		check(expected, "n/b.cfg", text, "ERROR: max_files must be a positive number");
+	}
+	for(int i = 0; i < 40; i++) {
+		snprintf(text, sizeof(text), i < 39 ? "include=%d.cfg\n" : "$VAULT:END$=end\n", i + 1);
+		snprintf(to, sizeof(to), "chain/%d.cfg", i);
+		write_vault(to, text);
+	}
+	check("chain of 40 files, no depth limit", "chain/0.cfg", "", "OK: VAULT:END=end");
+
+	/* last definition wins */
+	write_vault("p/vault.cfg", "$VAULT:DB$=default\n$VAULT:DB$=again\ninclude=over.cfg\n$VAULT:DB$=trailing\n");
+	write_vault("p/over.cfg", "$VAULT:DB$=included\n");
+	check("Override and trailing override", "p/vault.cfg", "", "OK: VAULT:DB=trailing");
+	write_vault("p/default.cfg", "$VAULT:DB$=default\ninclude=over.cfg\n");
+	check("include overrides a default", "p/default.cfg", "", "OK: VAULT:DB=included");
+
+	/* non-empty vault files */
+	write_vault("e/vault.cfg", "$VAULT:A$=a\ninclude=comment.cfg\n");
+	write_vault("e/comment.cfg", "# placeholder\n");
+	check("Comment-only file", "e/vault.cfg", "", "OK: VAULT:A=a");
+	write_vault("e/comment-root.cfg", "# only a comment\n");
+	check("comment-only vault", "e/comment-root.cfg", "", "OK:");
+	write_vault("e/inc.cfg", "$VAULT:A$=a\ninclude=x.cfg\n");
+	write_vault("e/x.cfg", "");
+	check("Empty or whitespace-only file: empty include", "e/inc.cfg", "", "ERROR: e/x.cfg, wrong password?");
+	write_vault("e/x.cfg", "  \n\t\n\n");
+	check("Empty or whitespace-only file: whitespace-only include", "e/inc.cfg", "", "ERROR: e/x.cfg, wrong password?");
+
+	/* atomic load */
+	write_vault("f/vault.cfg", "$VAULT:A$=a\ninclude=x/y.cfg\n");
+	write_vault("f/x/y.cfg", "$VAULT:Y$=y\ninclude=z.cfg\n");
+	write_vault("f/x/z.cfg", "garbage line\n");
+	check("Failing nested include", "f/vault.cfg", "", "ERROR: parse error in vault file");
+	ok(!partial_store, "Failing nested include: no partial macro store is kept");
+}
+
 static int remove_entry(const char *path, const struct stat *st, int flag, struct FTW *ftw)
 {
 	return remove(path);
@@ -258,6 +430,7 @@ int main(void)
 	test_vim_compatibility(kat_dir);
 	test_single_file();
 	test_bounds();
+	test_includes();
 
 	close_log_file();
 	nftw(workdir, remove_entry, 16, FTW_DEPTH | FTW_PHYS);
