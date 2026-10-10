@@ -201,6 +201,34 @@ static void test_single_file(void)
 	check("missing file", "missing.cfg", "", "ERROR: cannot read vault file");
 }
 
+static void test_bounds(void)
+{
+	char data[64], long_text[2048] = "", name[64], expected[sizeof(long_text) + 16] = "OK:";
+	const char *text = "$VAULT1$=0123456789\n";
+	int len = strlen(text);
+
+	/* vim writes 12 bytes header, 8 bytes salt, 8 bytes seed, then the ciphertext */
+	encrypt_vault(data, "saltsalt", "seedseed", text, len);
+	for(int size = 5; size < 28; size += 5) {
+		write_file("truncated.cfg", data, size);
+		snprintf(name, sizeof(name), "Truncated file: after %d bytes", size);
+		check(name, "truncated.cfg", "", size < 12 ? "ERROR: is not a vim crypted file" : "ERROR: is truncated");
+	}
+	write_file("short.cfg", "short\n", 6);
+	check("plaintext file shorter than a header", "short.cfg", "", "ERROR: is not a vim crypted file");
+	check("directory instead of a file", "", "", "ERROR: is not a vim crypted file");
+	write_vault("empty.cfg", "");
+	check("empty plaintext", "empty.cfg", "", "ERROR: no macros found");
+
+	/* many blocks, values of all lengths */
+	for(int i = 0; i < 40; i++) {
+		snprintf(long_text + strlen(long_text), sizeof(long_text) - strlen(long_text), "$VAULT%d$=%.*s\n", i, i + 1, "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGH");
+		snprintf(expected + strlen(expected), sizeof(expected) - strlen(expected), " VAULT%d=%.*s", i, i + 1, "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGH");
+	}
+	write_vault("long.cfg", long_text);
+	check("vault with many blocks", "long.cfg", "", expected);
+}
+
 static int remove_entry(const char *path, const struct stat *st, int flag, struct FTW *ftw)
 {
 	return remove(path);
@@ -229,6 +257,7 @@ int main(void)
 
 	test_vim_compatibility(kat_dir);
 	test_single_file();
+	test_bounds();
 
 	close_log_file();
 	nftw(workdir, remove_entry, 16, FTW_DEPTH | FTW_PHYS);

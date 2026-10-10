@@ -1,5 +1,9 @@
 # Naemon VimCrypt Vault Broker
 
+## Unreleased
+
+- Fix out-of-bounds key write and ciphertext over-read, reject truncated vault files.
+
 ## v1.5.1 (2026-03-20)
 
 - Rebuild for current Naemon broker API (packaging/version bump only).
